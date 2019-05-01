@@ -5,7 +5,9 @@ import voluptuous as vol
 
 from homeassistant.core import callback
 from homeassistant.components.light import (
-    ATTR_BRIGHTNESS, ENTITY_ID_FORMAT, Light, SUPPORT_BRIGHTNESS)
+    ENTITY_ID_FORMAT, Light,
+    ATTR_BRIGHTNESS, SUPPORT_BRIGHTNESS,
+    ATTR_HS_COLOR, SUPPORT_COLOR)
 from homeassistant.const import (
     CONF_VALUE_TEMPLATE, CONF_ICON_TEMPLATE, CONF_ENTITY_PICTURE_TEMPLATE,
     CONF_ENTITY_ID, CONF_FRIENDLY_NAME, STATE_ON, STATE_OFF,
@@ -25,6 +27,8 @@ CONF_ON_ACTION = 'turn_on'
 CONF_OFF_ACTION = 'turn_off'
 CONF_LEVEL_ACTION = 'set_level'
 CONF_LEVEL_TEMPLATE = 'level_template'
+CONF_COLOR_ACTION = 'set_color'
+CONF_COLOR_TEMPLATE = 'color_template'
 
 LIGHT_SCHEMA = vol.Schema({
     vol.Required(CONF_ON_ACTION): cv.SCRIPT_SCHEMA,
@@ -34,12 +38,14 @@ LIGHT_SCHEMA = vol.Schema({
     vol.Optional(CONF_ENTITY_PICTURE_TEMPLATE): cv.template,
     vol.Optional(CONF_LEVEL_ACTION): cv.SCRIPT_SCHEMA,
     vol.Optional(CONF_LEVEL_TEMPLATE): cv.template,
+    vol.Optional(CONF_COLOR_ACTION): cv.SCRIPT_SCHEMA,
+    vol.Optional(CONF_COLOR_TEMPLATE): cv.template,
     vol.Optional(CONF_FRIENDLY_NAME): cv.string,
     vol.Optional(CONF_ENTITY_ID): cv.entity_ids
 })
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend({
-    vol.Required(CONF_LIGHTS): cv.schema_with_slug_keys(LIGHT_SCHEMA),
+    vol.Required(CONF_LIGHTS): vol.Schema({cv.slug: LIGHT_SCHEMA}),
 })
 
 
@@ -58,6 +64,8 @@ async def async_setup_platform(hass, config, async_add_entities,
         off_action = device_config[CONF_OFF_ACTION]
         level_action = device_config.get(CONF_LEVEL_ACTION)
         level_template = device_config.get(CONF_LEVEL_TEMPLATE)
+        color_action = device_config.get(CONF_COLOR_ACTION)
+        color_template = device_config.get(CONF_COLOR_TEMPLATE)
 
         template_entity_ids = set()
 
@@ -68,6 +76,11 @@ async def async_setup_platform(hass, config, async_add_entities,
 
         if level_template is not None:
             temp_ids = level_template.extract_entities()
+            if str(temp_ids) != MATCH_ALL:
+                template_entity_ids |= set(temp_ids)
+
+        if color_template is not None:
+            temp_ids = color_template.extract_entities()
             if str(temp_ids) != MATCH_ALL:
                 template_entity_ids |= set(temp_ids)
 
@@ -90,7 +103,7 @@ async def async_setup_platform(hass, config, async_add_entities,
             LightTemplate(
                 hass, device, friendly_name, state_template,
                 icon_template, entity_picture_template, on_action,
-                off_action, level_action, level_template, entity_ids)
+                off_action, level_action, level_template, color_action, color_template, entity_ids)
         )
 
     if not lights:
@@ -106,7 +119,8 @@ class LightTemplate(Light):
 
     def __init__(self, hass, device_id, friendly_name, state_template,
                  icon_template, entity_picture_template, on_action,
-                 off_action, level_action, level_template, entity_ids):
+                 off_action, level_action, level_template,
+                 color_action, color_template, entity_ids):
         """Initialize the light."""
         self.hass = hass
         self.entity_id = async_generate_entity_id(
@@ -121,17 +135,24 @@ class LightTemplate(Light):
         if level_action is not None:
             self._level_script = Script(hass, level_action)
         self._level_template = level_template
+        self._color_script = None
+        if color_action is not None:
+            self._color_script = Script(hass, color_action)
+        self._color_template = color_template
 
         self._state = False
         self._icon = None
         self._entity_picture = None
         self._brightness = None
+        self._hs_color = None
         self._entities = entity_ids
 
         if self._template is not None:
             self._template.hass = self.hass
         if self._level_template is not None:
             self._level_template.hass = self.hass
+        if self._color_template is not None:
+            self._color_template.hass = self.hass
         if self._icon_template is not None:
             self._icon_template.hass = self.hass
         if self._entity_picture_template is not None:
@@ -143,6 +164,11 @@ class LightTemplate(Light):
         return self._brightness
 
     @property
+    def hs_color(self):
+        """Return the hs_color of the light."""
+        return self._hs_color
+
+    @property
     def name(self):
         """Return the display name of this light."""
         return self._name
@@ -150,10 +176,13 @@ class LightTemplate(Light):
     @property
     def supported_features(self):
         """Flag supported features."""
+        features = 0
         if self._level_script is not None:
-            return SUPPORT_BRIGHTNESS
+            features += SUPPORT_BRIGHTNESS
+        if self._color_script is not None:
+            features += SUPPORT_COLOR
 
-        return 0
+        return features
 
     @property
     def is_on(self):
@@ -186,7 +215,8 @@ class LightTemplate(Light):
         def template_light_startup(event):
             """Update template on startup."""
             if (self._template is not None or
-                    self._level_template is not None):
+                    self._level_template is not None or
+                    self._color_template is not None):
                 async_track_state_change(
                     self.hass, self._entities, template_light_state_listener)
 
@@ -198,21 +228,41 @@ class LightTemplate(Light):
     async def async_turn_on(self, **kwargs):
         """Turn the light on."""
         optimistic_set = False
+        turned_on = False
+
         # set optimistic states
         if self._template is None:
             self._state = True
             optimistic_set = True
 
-        if self._level_template is None and ATTR_BRIGHTNESS in kwargs:
-            _LOGGER.info("Optimistically setting brightness to %s",
-                         kwargs[ATTR_BRIGHTNESS])
-            self._brightness = kwargs[ATTR_BRIGHTNESS]
-            optimistic_set = True
+        if ATTR_BRIGHTNESS in kwargs:
+            if self._level_template is None:
+                _LOGGER.info("Optimistically setting brightness to %s",
+                             kwargs[ATTR_BRIGHTNESS])
+                self._brightness = kwargs[ATTR_BRIGHTNESS]
+                optimistic_set = True
 
-        if ATTR_BRIGHTNESS in kwargs and self._level_script:
-            await self._level_script.async_run(
-                {"brightness": kwargs[ATTR_BRIGHTNESS]}, context=self._context)
-        else:
+            if self._level_script:
+                params = {}
+                params[ATTR_BRIGHTNESS] = kwargs[ATTR_BRIGHTNESS]
+                await self._level_script.async_run(params, context=self._context)
+                turned_on = True
+
+        if ATTR_HS_COLOR in kwargs:
+            if self._color_template is None:
+                _LOGGER.info("Optimistically setting color to %s, %s",
+                             kwargs[ATTR_HS_COLOR][0], kwargs[ATTR_HS_COLOR][1])
+                self._hs_color = kwargs[ATTR_HS_COLOR]
+                optimistic_set = True
+
+            if self._color_script is not None:
+                params = {}
+                params[ATTR_HS_COLOR] = kwargs[ATTR_HS_COLOR]
+                await self._color_script.async_run(params, context=self._context)
+                turned_on = True
+
+        """if brightness and/or color were set, the light is already on"""
+        if not turned_on:
             await self._on_script.async_run()
 
         if optimistic_set:
@@ -256,6 +306,20 @@ class LightTemplate(Light):
                     'Received invalid brightness : %s. Expected: 0-255',
                     brightness)
                 self._brightness = None
+
+        if self._color_template is not None:
+            try:
+                hs_color = self._color_template.async_render()
+                if hs_color is None or hs_color == "None":
+                    self._hs_color = None
+                else:
+                    hs_color = hs_color.strip("[()]").split(",")
+                    self._hs_color = [float(hs_color[0]), float(hs_color[1])]
+            except TemplateError as ex:
+                _LOGGER.error(ex)
+                self._state = None
+                self._hs_color = None
+
 
         for property_name, template in (
                 ('_icon', self._icon_template),
